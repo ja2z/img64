@@ -1,56 +1,76 @@
 # img64
 
-AWS Lambda that fetches an image and returns an HTML `<img>` tag with a `data:` URI `src` — i.e. a fully inline, self-contained image element.
+POST a base64 image, get back a public CloudFront URL pointing at the decoded PNG/JPEG/etc. — useful when a downstream system requires an `http(s)` image URL and won't accept a `data:` URI.
 
 ## Live endpoint
 
 ```
-https://umeu6ml921.execute-api.us-west-2.amazonaws.com
+POST https://umeu6ml921.execute-api.us-west-2.amazonaws.com/
 ```
 
-Example:
+Public URLs are returned on the CloudFront distribution backing `s3://big-buys-public/img64/`:
 
 ```
-curl 'https://umeu6ml921.execute-api.us-west-2.amazonaws.com/?url=https://www.google.com/images/branding/googlelogo/2x/googlelogo_color_92x30dp.png&format=html'
+https://d2le8l2yvdies6.cloudfront.net/img64/<sha256-prefix>.<ext>
 ```
 
-API Gateway HTTP API `umeu6ml921` (region `us-west-2`) → Lambda `img64`. Stage `$default` is throttled to 20 req/s sustained / 40 burst.
+## Request formats
 
-## API
+The Lambda accepts three input shapes — pick whichever your caller produces.
 
-Accepts `GET` (query params) or `POST` (JSON body).
+### 1. JSON body (preferred)
 
-| Param    | Required | Description                                                |
-| -------- | -------- | ---------------------------------------------------------- |
-| `url`    | yes      | `http(s)` URL of the image to inline                        |
-| `alt`    | no       | `alt` attribute for the returned `<img>` tag                |
-| `format` | no       | `json` (default) or `html` for raw `<img …/>` body          |
+```bash
+curl -X POST https://umeu6ml921.execute-api.us-west-2.amazonaws.com/ \
+  -H 'Content-Type: application/json' \
+  -d '{"data":"iVBORw0KGgoAAAANSUhEUg...","type":"image/png"}'
+```
 
-### Default JSON response
+`type` is optional — magic bytes are sniffed from the decoded data either way. Declared type is only used as a fallback when the bytes can't be sniffed (basically just SVG).
+
+### 2. Data URI in `data`
+
+```json
+{"data":"data:image/png;base64,iVBORw0KGgo..."}
+```
+
+The MIME from the prefix is parsed and used as a hint; bytes still win.
+
+### 3. Raw base64 in the body
+
+```bash
+curl -X POST https://umeu6ml921.execute-api.us-west-2.amazonaws.com/ \
+  -H 'Content-Type: text/plain' \
+  --data-binary @my-image.b64
+```
+
+## Response
 
 ```json
 {
   "success": true,
-  "tag": "<img src=\"data:image/png;base64,iVBOR...\" />",
-  "dataUri": "data:image/png;base64,iVBOR...",
+  "url": "https://d2le8l2yvdies6.cloudfront.net/img64/b1ff9c8ea3a780bad09b346c423d2d0e.png",
+  "key": "img64/b1ff9c8ea3a780bad09b346c423d2d0e.png",
   "contentType": "image/png",
-  "byteLength": 12345
+  "byteLength": 69
 }
 ```
 
-### Limits & safety
+The object key is the **first 32 hex chars of the SHA-256 of the decoded bytes**, plus an extension. Same image → same URL → free deduplication.
 
-- Max image size: 10 MB (responses larger than ~6 MB will hit API Gateway's sync invoke cap regardless)
-- Upstream fetch timeout: 8 s
-- Allowed content types: png, jpeg, gif, webp, svg+xml, bmp, ico, avif, apng, tiff
-- SSRF protection: the target hostname is DNS-resolved before fetch; any address in RFC1918, loopback, link-local (incl. `169.254.169.254`), or other reserved ranges is rejected with `400`
+## Limits & safety
+
+- Decoded image cap: 10 MB
+- Allowed types: png, jpeg, gif, webp, svg+xml, bmp, ico, avif, tiff
+- Magic-byte sniffing: the declared `type` is *never* trusted — the actual bytes are sniffed and the response always reflects the real format
+- Stage throttling: 20 rps sustained / 40 burst
+- CORS: open (`*`) — anyone can POST from a browser; abuse mitigated by throttling and the size cap
 
 ## Develop
 
 ```bash
 npm install
-npm run build      # tsc
-./build-lambda.sh  # produces img64.zip
+./build-lambda.sh   # produces img64.zip
 ./deploy-lambda-s3.sh
 ```
 
@@ -60,16 +80,12 @@ Deploy script defaults — override with env vars:
 - `IMG64_REGION` (default: `us-west-2`)
 - `IMG64_DEPLOY_BUCKET` (default: `mobile-lambda-deployments`)
 
+Lambda runtime config (env vars on the function itself, all have sensible defaults):
+
+- `IMG64_BUCKET` — S3 bucket (default `big-buys-public`)
+- `IMG64_BUCKET_REGION` — S3 bucket region (default `us-west-1`)
+- `IMG64_KEY_PREFIX` — object key prefix (default `img64/`)
+- `IMG64_PUBLIC_URL_BASE` — CloudFront origin to prepend (default `https://d2le8l2yvdies6.cloudfront.net`)
+- `IMG64_MAX_BYTES` — decoded image size cap
+
 See [CLAUDE.md](./CLAUDE.md) for AWS auth/SSL conventions used by the deploy script.
-
-## Local invoke
-
-```bash
-aws lambda invoke \
-    --function-name img64 \
-    --region us-west-2 \
-    --cli-binary-format raw-in-base64-out \
-    --payload file://test-event.json \
-    --no-verify-ssl \
-    response.json
-```

@@ -1,37 +1,48 @@
 import type { APIGatewayProxyResultV2 } from 'aws-lambda';
-import * as dns from 'dns/promises';
-import * as net from 'net';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import * as crypto from 'crypto';
 
 type AnyEvent = any;
 
-const MAX_BYTES = 10 * 1024 * 1024; // 10 MB — keep response under API Gateway's 6 MB sync cap after base64 expansion
-const FETCH_TIMEOUT_MS = 8000;
+const BUCKET = process.env.IMG64_BUCKET || 'big-buys-public';
+const BUCKET_REGION = process.env.IMG64_BUCKET_REGION || 'us-west-1';
+const KEY_PREFIX = process.env.IMG64_KEY_PREFIX || 'img64/';
+const PUBLIC_URL_BASE = process.env.IMG64_PUBLIC_URL_BASE || 'https://d2le8l2yvdies6.cloudfront.net';
+const MAX_DECODED_BYTES = Number(process.env.IMG64_MAX_BYTES || 10 * 1024 * 1024); // 10 MB
 
-const ALLOWED_CONTENT_TYPES = new Set([
-    'image/png',
-    'image/jpeg',
-    'image/gif',
-    'image/webp',
-    'image/svg+xml',
-    'image/bmp',
-    'image/x-icon',
-    'image/vnd.microsoft.icon',
-    'image/avif',
-    'image/apng',
-    'image/tiff',
-]);
+const s3 = new S3Client({ region: BUCKET_REGION });
 
-interface RequestParams {
-    url?: string;
-    alt?: string;
-    format?: 'json' | 'html';
+// MIME ↔ extension map for the small set of image types we serve.
+const MIME_TO_EXT: Record<string, string> = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/gif': 'gif',
+    'image/webp': 'webp',
+    'image/svg+xml': 'svg',
+    'image/bmp': 'bmp',
+    'image/x-icon': 'ico',
+    'image/vnd.microsoft.icon': 'ico',
+    'image/avif': 'avif',
+    'image/apng': 'png',
+    'image/tiff': 'tiff',
+};
+
+interface ParsedInput {
+    rawBase64: string;       // base64 without any data: prefix
+    declaredType?: string;   // MIME from data URI or `type` param, if present
+}
+
+class HttpError extends Error {
+    constructor(public statusCode: number, message: string) {
+        super(message);
+    }
 }
 
 function corsHeaders(extra: Record<string, string> = {}): Record<string, string> {
     return {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
         ...extra,
     };
 }
@@ -44,219 +55,155 @@ function jsonResponse(statusCode: number, body: any): APIGatewayProxyResultV2 {
     };
 }
 
-function htmlResponse(statusCode: number, body: string): APIGatewayProxyResultV2 {
-    return {
-        statusCode,
-        headers: corsHeaders({ 'Content-Type': 'text/html; charset=utf-8' }),
-        body,
-    };
-}
-
 function getMethod(event: AnyEvent): string {
-    return (
-        event.requestContext?.http?.method ||
-        event.httpMethod ||
-        'GET'
-    ).toUpperCase();
+    return (event.requestContext?.http?.method || event.httpMethod || 'GET').toUpperCase();
 }
 
-function parseParams(event: AnyEvent): RequestParams {
-    const method = getMethod(event);
-    const query = event.queryStringParameters || {};
+function readBodyString(event: AnyEvent): string {
+    if (!event.body) return '';
+    return event.isBase64Encoded
+        ? Buffer.from(event.body, 'base64').toString('utf8')
+        : event.body;
+}
 
-    if (method === 'POST' && event.body) {
+function parseInput(event: AnyEvent): ParsedInput {
+    const body = readBodyString(event);
+    if (!body) throw new HttpError(400, 'Empty request body');
+
+    let dataField: string | undefined;
+    let typeField: string | undefined;
+
+    // Try JSON first; fall back to raw base64 / data-URI body
+    if (body.trimStart().startsWith('{')) {
+        let parsed: any;
         try {
-            const raw = event.isBase64Encoded
-                ? Buffer.from(event.body, 'base64').toString('utf8')
-                : event.body;
-            const parsed = JSON.parse(raw);
-            return {
-                url: parsed.url ?? query.url,
-                alt: parsed.alt ?? query.alt,
-                format: (parsed.format ?? query.format) as RequestParams['format'],
-            };
+            parsed = JSON.parse(body);
         } catch {
-            // Fall through to query params if body isn't valid JSON
+            throw new HttpError(400, 'Body looks like JSON but failed to parse');
         }
+        dataField = typeof parsed.data === 'string' ? parsed.data : undefined;
+        typeField = typeof parsed.type === 'string' ? parsed.type : undefined;
+    } else {
+        dataField = body.trim();
     }
 
-    return {
-        url: query.url,
-        alt: query.alt,
-        format: query.format as RequestParams['format'],
-    };
+    if (!dataField) throw new HttpError(400, 'Missing required field: data');
+
+    // Strip data: URI prefix if present, e.g. "data:image/png;base64,iVBOR..."
+    const dataUriMatch = dataField.match(/^data:([^;,]+)?(;base64)?,(.+)$/s);
+    let rawBase64: string;
+    let declaredType: string | undefined = typeField?.trim().toLowerCase() || undefined;
+
+    if (dataUriMatch) {
+        const [, mimeFromUri, hasBase64, payload] = dataUriMatch;
+        if (!hasBase64) throw new HttpError(400, 'data URI must be base64-encoded');
+        rawBase64 = payload;
+        if (mimeFromUri && !declaredType) declaredType = mimeFromUri.toLowerCase();
+    } else {
+        rawBase64 = dataField;
+    }
+
+    // Strip whitespace/newlines that often sneak in via copy-paste
+    rawBase64 = rawBase64.replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/=]+$/.test(rawBase64)) {
+        throw new HttpError(400, 'data is not valid base64');
+    }
+
+    return { rawBase64, declaredType };
 }
 
-function escapeHtmlAttr(value: string): string {
-    return value
-        .replace(/&/g, '&amp;')
-        .replace(/"/g, '&quot;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-}
-
-function isHttpUrl(value: string): boolean {
-    try {
-        const u = new URL(value);
-        return u.protocol === 'http:' || u.protocol === 'https:';
-    } catch {
-        return false;
+// Sniff image magic bytes. Returns MIME or null if unrecognized.
+function sniffImageMime(buf: Buffer): string | null {
+    if (buf.length < 4) return null;
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+    // JPEG: FF D8 FF
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+    // GIF: "GIF87a" or "GIF89a"
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'image/gif';
+    // WebP: "RIFF????WEBP"
+    if (buf.length >= 12 && buf.slice(0, 4).toString() === 'RIFF' && buf.slice(8, 12).toString() === 'WEBP') return 'image/webp';
+    // BMP: "BM"
+    if (buf[0] === 0x42 && buf[1] === 0x4d) return 'image/bmp';
+    // ICO: 00 00 01 00
+    if (buf[0] === 0x00 && buf[1] === 0x00 && buf[2] === 0x01 && buf[3] === 0x00) return 'image/x-icon';
+    // TIFF: "II*\0" or "MM\0*"
+    if ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2a && buf[3] === 0x00) ||
+        (buf[0] === 0x4d && buf[1] === 0x4d && buf[2] === 0x00 && buf[3] === 0x2a)) return 'image/tiff';
+    // AVIF/HEIC: byte 4..8 == "ftyp" and brand starts with "avif"|"avis"|"heic"|"heix"|"mif1"
+    if (buf.length >= 12 && buf.slice(4, 8).toString() === 'ftyp') {
+        const brand = buf.slice(8, 12).toString();
+        if (brand === 'avif' || brand === 'avis') return 'image/avif';
     }
-}
-
-function ipv4ToInt(ip: string): number {
-    return ip.split('.').reduce((acc, oct) => (acc << 8) + Number(oct), 0) >>> 0;
-}
-
-function isPrivateOrReservedIPv4(ip: string): boolean {
-    const n = ipv4ToInt(ip);
-    const inRange = (cidr: string) => {
-        const [base, bits] = cidr.split('/');
-        const mask = bits === '32' ? 0xffffffff : (~0 << (32 - Number(bits))) >>> 0;
-        return (n & mask) === (ipv4ToInt(base) & mask);
-    };
-    return [
-        '0.0.0.0/8',
-        '10.0.0.0/8',
-        '100.64.0.0/10',     // carrier-grade NAT
-        '127.0.0.0/8',       // loopback
-        '169.254.0.0/16',    // link-local incl. AWS metadata 169.254.169.254
-        '172.16.0.0/12',
-        '192.0.0.0/24',
-        '192.0.2.0/24',
-        '192.168.0.0/16',
-        '198.18.0.0/15',
-        '198.51.100.0/24',
-        '203.0.113.0/24',
-        '224.0.0.0/4',
-        '240.0.0.0/4',
-        '255.255.255.255/32',
-    ].some(inRange);
-}
-
-function isPrivateOrReservedIPv6(ip: string): boolean {
-    const lower = ip.toLowerCase();
-    if (lower === '::' || lower === '::1') return true;
-    if (lower.startsWith('fe80:') || lower.startsWith('fe80::')) return true; // link-local
-    if (lower.startsWith('fc') || lower.startsWith('fd')) return true;        // unique local
-    if (lower.startsWith('ff')) return true;                                  // multicast
-    if (lower.startsWith('::ffff:')) {
-        // IPv4-mapped — check the embedded IPv4
-        const v4 = lower.slice('::ffff:'.length);
-        if (net.isIP(v4) === 4) return isPrivateOrReservedIPv4(v4);
-    }
-    return false;
-}
-
-async function assertPublicHost(hostname: string): Promise<void> {
-    // Block literal IPs that resolve to private/reserved space, and block any
-    // hostname whose DNS resolution returns a private/reserved address.
-    const literalKind = net.isIP(hostname);
-    if (literalKind === 4 && isPrivateOrReservedIPv4(hostname)) {
-        throw new HttpError(400, 'url resolves to a private or reserved address');
-    }
-    if (literalKind === 6 && isPrivateOrReservedIPv6(hostname)) {
-        throw new HttpError(400, 'url resolves to a private or reserved address');
-    }
-    if (literalKind !== 0) return;
-
-    let addrs: { address: string; family: number }[];
-    try {
-        addrs = await dns.lookup(hostname, { all: true });
-    } catch {
-        throw new HttpError(400, `Could not resolve host: ${hostname}`);
-    }
-    for (const { address, family } of addrs) {
-        const isPrivate = family === 6
-            ? isPrivateOrReservedIPv6(address)
-            : isPrivateOrReservedIPv4(address);
-        if (isPrivate) {
-            throw new HttpError(400, 'url resolves to a private or reserved address');
-        }
-    }
-}
-
-async function fetchImage(url: string): Promise<{ buffer: Buffer; contentType: string }> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-    let response: Response;
-    try {
-        response = await fetch(url, {
-            signal: controller.signal,
-            redirect: 'follow',
-            headers: { 'User-Agent': 'img64-lambda/0.1' },
-        });
-    } finally {
-        clearTimeout(timer);
-    }
-
-    if (!response.ok) {
-        throw new HttpError(502, `Upstream returned ${response.status} ${response.statusText}`);
-    }
-
-    const contentType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    if (!contentType || !ALLOWED_CONTENT_TYPES.has(contentType)) {
-        throw new HttpError(415, `Unsupported or missing image content-type: ${contentType || '(none)'}`);
-    }
-
-    const declaredLength = Number(response.headers.get('content-length'));
-    if (declaredLength && declaredLength > MAX_BYTES) {
-        throw new HttpError(413, `Image too large: ${declaredLength} bytes (max ${MAX_BYTES})`);
-    }
-
-    const arrayBuf = await response.arrayBuffer();
-    if (arrayBuf.byteLength > MAX_BYTES) {
-        throw new HttpError(413, `Image too large: ${arrayBuf.byteLength} bytes (max ${MAX_BYTES})`);
-    }
-
-    return { buffer: Buffer.from(arrayBuf), contentType };
-}
-
-class HttpError extends Error {
-    constructor(public statusCode: number, message: string) {
-        super(message);
-    }
+    // SVG: leading "<svg" or "<?xml" then "<svg" — best-effort text sniff
+    const head = buf.slice(0, 512).toString('utf8').trimStart().toLowerCase();
+    if (head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'))) return 'image/svg+xml';
+    return null;
 }
 
 export const handler = async (event: AnyEvent): Promise<APIGatewayProxyResultV2> => {
     if (getMethod(event) === 'OPTIONS') {
         return { statusCode: 204, headers: corsHeaders(), body: '' };
     }
+    if (getMethod(event) !== 'POST') {
+        return jsonResponse(405, { success: false, error: 'Use POST with a base64 payload' });
+    }
 
     try {
-        const { url, alt, format } = parseParams(event);
+        const { rawBase64, declaredType } = parseInput(event);
 
-        if (!url) {
-            return jsonResponse(400, { success: false, error: 'Missing required parameter: url' });
+        // Cheap pre-check: base64 has ~4/3 expansion, so cap before decoding
+        const approxDecodedSize = Math.floor((rawBase64.length * 3) / 4);
+        if (approxDecodedSize > MAX_DECODED_BYTES) {
+            throw new HttpError(413, `Decoded image would exceed ${MAX_DECODED_BYTES} bytes`);
         }
-        if (!isHttpUrl(url)) {
-            return jsonResponse(400, { success: false, error: 'url must be http(s)' });
+
+        const buf = Buffer.from(rawBase64, 'base64');
+        if (buf.length === 0) throw new HttpError(400, 'data decoded to zero bytes');
+        if (buf.length > MAX_DECODED_BYTES) {
+            throw new HttpError(413, `Decoded image is ${buf.length} bytes (max ${MAX_DECODED_BYTES})`);
         }
 
-        await assertPublicHost(new URL(url).hostname);
-
-        const { buffer, contentType } = await fetchImage(url);
-        const base64 = buffer.toString('base64');
-        const dataUri = `data:${contentType};base64,${base64}`;
-        const altAttr = alt ? ` alt="${escapeHtmlAttr(alt)}"` : '';
-        const tag = `<img src="${dataUri}"${altAttr} />`;
-
-        if (format === 'html') {
-            return htmlResponse(200, tag);
+        // Sniff the actual bytes — defense in depth, also catches arbitrary uploads
+        const sniffedType = sniffImageMime(buf);
+        let contentType: string;
+        if (sniffedType) {
+            contentType = sniffedType;
+            // If caller declared a different type, trust the bytes — log mismatch
+            if (declaredType && declaredType !== sniffedType) {
+                console.warn(`Type mismatch: caller declared ${declaredType}, bytes are ${sniffedType}. Using sniffed type.`);
+            }
+        } else if (declaredType && MIME_TO_EXT[declaredType]) {
+            // Couldn't sniff but caller declared an allowed image type — accept
+            contentType = declaredType;
+        } else {
+            throw new HttpError(415, `Could not identify image type${declaredType ? ` (declared: ${declaredType})` : ''}`);
         }
+
+        const ext = MIME_TO_EXT[contentType] || 'bin';
+
+        // SHA-256 of the bytes → 32 hex char prefix for the key. Natural dedup.
+        const hash = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 32);
+        const key = `${KEY_PREFIX}${hash}.${ext}`;
+
+        await s3.send(new PutObjectCommand({
+            Bucket: BUCKET,
+            Key: key,
+            Body: buf,
+            ContentType: contentType,
+            CacheControl: 'public, max-age=31536000, immutable',
+        }));
+
+        const publicUrl = `${PUBLIC_URL_BASE.replace(/\/$/, '')}/${key}`;
 
         return jsonResponse(200, {
             success: true,
-            tag,
-            dataUri,
+            url: publicUrl,
+            key,
             contentType,
-            byteLength: buffer.length,
+            byteLength: buf.length,
         });
     } catch (error: any) {
-        if (error?.name === 'AbortError') {
-            return jsonResponse(504, { success: false, error: 'Upstream fetch timed out' });
-        }
         if (error instanceof HttpError) {
             return jsonResponse(error.statusCode, { success: false, error: error.message });
         }

@@ -32,15 +32,20 @@ cp dist/index.js index.js
 echo "  ✓ Copied index.js to root"
 
 echo ""
+echo "📦 Installing prod-only deps into a clean tree..."
+# Reinstall with --omit=dev so the zip only contains runtime deps.
+rm -rf node_modules
+npm install --omit=dev --silent
+
+echo ""
 echo "🗜️  Creating $ZIP_FILE..."
-# Lambda has no runtime dependencies (uses Node 18+ built-in fetch),
-# so we never bundle node_modules. If real prod deps are ever added,
-# add an `npm ci --omit=dev` step here and include node_modules.
-zip -rq "$ZIP_FILE" index.js
+zip -rq "$ZIP_FILE" index.js node_modules
 
 echo ""
 echo "🧹 Cleaning up temporary files..."
 rm -f index.js
+# Restore full deps (incl. devDeps) so subsequent `tsc` / editor tooling work
+npm install --silent
 
 echo ""
 echo "✅ Build complete: $ZIP_FILE ($(du -h "$ZIP_FILE" | cut -f1))"

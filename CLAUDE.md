@@ -1,28 +1,32 @@
 # img64
 
-A tiny AWS Lambda that fetches an image and returns an HTML `<img>` tag whose `src` is a `data:` URI containing the base64-encoded image. Useful when an embed environment needs a fully self-contained image (no external fetches).
+POST a base64 image, get back a public CloudFront URL pointing at the decoded bytes. Used when a consumer system requires an `http(s)` image URL and won't accept a `data:` URI.
 
 ## Project layout
 
 ```
 img64/
-  index.ts             # Lambda handler
-  package.json         # Node deps
+  index.ts             # Lambda handler (POST → S3 → CloudFront URL)
+  package.json         # Node deps (@aws-sdk/client-s3 at runtime)
   tsconfig.json        # TS config (ES2020 / commonjs)
-  build-lambda.sh      # Compile + zip
+  build-lambda.sh      # Compile + zip with prod-only node_modules
   deploy-lambda-s3.sh  # Upload zip to S3 and update Lambda
-  test-event.json      # Sample API Gateway event for local invoke
 ```
 
-The handler is API-Gateway-shaped: it reads `event.body` (POST) or `event.queryStringParameters` (GET) and returns a `{ statusCode, headers, body }` response with CORS headers. Node 18+ `fetch` is used directly — no extra HTTP dependency.
+Handler accepts POST only — JSON `{data, type?}`, a `data:` URI in `data`, or raw base64 in the body. SHA-256 of the decoded bytes (32 hex prefix) becomes the S3 key, giving free dedup.
 
-## Deployed resources (us-west-2, account 763903610969)
+## Deployed resources (account 763903610969)
 
-- Lambda function: `img64` (Node 20.x, arm64, 256 MB, 15s timeout, handler `index.handler`)
-- IAM role: `img64-lambda-role` (AWSLambdaBasicExecutionRole attached)
-- API Gateway HTTP API: `umeu6ml921` (`img64`) → `$default` route → Lambda proxy integration; `$default` stage throttled 20 rps / 40 burst, auto-deploy on
-- Lambda resource policy `apigateway-invoke` allows `arn:aws:execute-api:us-west-2:763903610969:umeu6ml921/*/*` to invoke
-- Public URL: `https://umeu6ml921.execute-api.us-west-2.amazonaws.com`
+| Resource | Region | Notes |
+| --- | --- | --- |
+| Lambda `img64` | us-west-2 | Node 20.x, arm64, 512 MB, 20s timeout, handler `index.handler` |
+| IAM role `img64-lambda-role` | global | AWSLambdaBasicExecutionRole + inline `img64-s3-write` (PutObject on `arn:aws:s3:::big-buys-public/img64/*`) |
+| HTTP API `umeu6ml921` (`img64`) | us-west-2 | `$default` route → Lambda proxy; stage `$default` throttled 20/40 rps; auto-deploy on |
+| S3 bucket `big-buys-public` | us-west-1 | Lambda writes under `img64/`; public access blocked at bucket level |
+| CloudFront `E26QSBDXVY9MGJ` (`d2le8l2yvdies6.cloudfront.net`) | global | Serves the bucket publicly with no origin path |
+
+- Public endpoint: `POST https://umeu6ml921.execute-api.us-west-2.amazonaws.com/`
+- Public URL pattern: `https://d2le8l2yvdies6.cloudfront.net/img64/<sha256-prefix>.<ext>`
 
 ## AWS conventions (this org)
 
