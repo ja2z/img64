@@ -2,6 +2,20 @@
 
 AWS Lambda that fetches an image and returns an HTML `<img>` tag with a `data:` URI `src` — i.e. a fully inline, self-contained image element.
 
+## Live endpoint
+
+```
+https://umeu6ml921.execute-api.us-west-2.amazonaws.com
+```
+
+Example:
+
+```
+curl 'https://umeu6ml921.execute-api.us-west-2.amazonaws.com/?url=https://www.google.com/images/branding/googlelogo/2x/googlelogo_color_92x30dp.png&format=html'
+```
+
+API Gateway HTTP API `umeu6ml921` (region `us-west-2`) → Lambda `img64`. Stage `$default` is throttled to 20 req/s sustained / 40 burst.
+
 ## API
 
 Accepts `GET` (query params) or `POST` (JSON body).
@@ -24,11 +38,12 @@ Accepts `GET` (query params) or `POST` (JSON body).
 }
 ```
 
-### Limits
+### Limits & safety
 
 - Max image size: 10 MB (responses larger than ~6 MB will hit API Gateway's sync invoke cap regardless)
 - Upstream fetch timeout: 8 s
 - Allowed content types: png, jpeg, gif, webp, svg+xml, bmp, ico, avif, apng, tiff
+- SSRF protection: the target hostname is DNS-resolved before fetch; any address in RFC1918, loopback, link-local (incl. `169.254.169.254`), or other reserved ranges is rejected with `400`
 
 ## Develop
 

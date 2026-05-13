@@ -33,14 +33,10 @@ echo "  ✓ Copied index.js to root"
 
 echo ""
 echo "🗜️  Creating $ZIP_FILE..."
-# Lambda has no runtime dependencies (uses Node 18+ built-in fetch).
-# Only @types/* devDependencies exist, so node_modules isn't needed at runtime;
-# include it only if it grew real prod deps.
-if [ -d "node_modules" ] && [ -n "$(ls -A node_modules 2>/dev/null)" ] && find node_modules -mindepth 1 -maxdepth 1 -type d ! -name '@types' ! -name 'typescript' ! -name '.bin' | grep -q .; then
-    zip -rq "$ZIP_FILE" index.js node_modules
-else
-    zip -rq "$ZIP_FILE" index.js
-fi
+# Lambda has no runtime dependencies (uses Node 18+ built-in fetch),
+# so we never bundle node_modules. If real prod deps are ever added,
+# add an `npm ci --omit=dev` step here and include node_modules.
+zip -rq "$ZIP_FILE" index.js
 
 echo ""
 echo "🧹 Cleaning up temporary files..."

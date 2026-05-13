@@ -16,6 +16,14 @@ img64/
 
 The handler is API-Gateway-shaped: it reads `event.body` (POST) or `event.queryStringParameters` (GET) and returns a `{ statusCode, headers, body }` response with CORS headers. Node 18+ `fetch` is used directly — no extra HTTP dependency.
 
+## Deployed resources (us-west-2, account 763903610969)
+
+- Lambda function: `img64` (Node 20.x, arm64, 256 MB, 15s timeout, handler `index.handler`)
+- IAM role: `img64-lambda-role` (AWSLambdaBasicExecutionRole attached)
+- API Gateway HTTP API: `umeu6ml921` (`img64`) → `$default` route → Lambda proxy integration; `$default` stage throttled 20 rps / 40 burst, auto-deploy on
+- Lambda resource policy `apigateway-invoke` allows `arn:aws:execute-api:us-west-2:763903610969:umeu6ml921/*/*` to invoke
+- Public URL: `https://umeu6ml921.execute-api.us-west-2.amazonaws.com`
+
 ## AWS conventions (this org)
 
 These mirror the rules in [/Users/jonathanavrach/code/mobile/.cursor/rules/aws-cli-usage.mdc](/Users/jonathanavrach/code/mobile/.cursor/rules/aws-cli-usage.mdc) — keep them in sync if anything diverges.

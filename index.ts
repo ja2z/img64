@@ -1,4 +1,6 @@
 import type { APIGatewayProxyResultV2 } from 'aws-lambda';
+import * as dns from 'dns/promises';
+import * as net from 'net';
 
 type AnyEvent = any;
 
@@ -102,6 +104,78 @@ function isHttpUrl(value: string): boolean {
     }
 }
 
+function ipv4ToInt(ip: string): number {
+    return ip.split('.').reduce((acc, oct) => (acc << 8) + Number(oct), 0) >>> 0;
+}
+
+function isPrivateOrReservedIPv4(ip: string): boolean {
+    const n = ipv4ToInt(ip);
+    const inRange = (cidr: string) => {
+        const [base, bits] = cidr.split('/');
+        const mask = bits === '32' ? 0xffffffff : (~0 << (32 - Number(bits))) >>> 0;
+        return (n & mask) === (ipv4ToInt(base) & mask);
+    };
+    return [
+        '0.0.0.0/8',
+        '10.0.0.0/8',
+        '100.64.0.0/10',     // carrier-grade NAT
+        '127.0.0.0/8',       // loopback
+        '169.254.0.0/16',    // link-local incl. AWS metadata 169.254.169.254
+        '172.16.0.0/12',
+        '192.0.0.0/24',
+        '192.0.2.0/24',
+        '192.168.0.0/16',
+        '198.18.0.0/15',
+        '198.51.100.0/24',
+        '203.0.113.0/24',
+        '224.0.0.0/4',
+        '240.0.0.0/4',
+        '255.255.255.255/32',
+    ].some(inRange);
+}
+
+function isPrivateOrReservedIPv6(ip: string): boolean {
+    const lower = ip.toLowerCase();
+    if (lower === '::' || lower === '::1') return true;
+    if (lower.startsWith('fe80:') || lower.startsWith('fe80::')) return true; // link-local
+    if (lower.startsWith('fc') || lower.startsWith('fd')) return true;        // unique local
+    if (lower.startsWith('ff')) return true;                                  // multicast
+    if (lower.startsWith('::ffff:')) {
+        // IPv4-mapped — check the embedded IPv4
+        const v4 = lower.slice('::ffff:'.length);
+        if (net.isIP(v4) === 4) return isPrivateOrReservedIPv4(v4);
+    }
+    return false;
+}
+
+async function assertPublicHost(hostname: string): Promise<void> {
+    // Block literal IPs that resolve to private/reserved space, and block any
+    // hostname whose DNS resolution returns a private/reserved address.
+    const literalKind = net.isIP(hostname);
+    if (literalKind === 4 && isPrivateOrReservedIPv4(hostname)) {
+        throw new HttpError(400, 'url resolves to a private or reserved address');
+    }
+    if (literalKind === 6 && isPrivateOrReservedIPv6(hostname)) {
+        throw new HttpError(400, 'url resolves to a private or reserved address');
+    }
+    if (literalKind !== 0) return;
+
+    let addrs: { address: string; family: number }[];
+    try {
+        addrs = await dns.lookup(hostname, { all: true });
+    } catch {
+        throw new HttpError(400, `Could not resolve host: ${hostname}`);
+    }
+    for (const { address, family } of addrs) {
+        const isPrivate = family === 6
+            ? isPrivateOrReservedIPv6(address)
+            : isPrivateOrReservedIPv4(address);
+        if (isPrivate) {
+            throw new HttpError(400, 'url resolves to a private or reserved address');
+        }
+    }
+}
+
 async function fetchImage(url: string): Promise<{ buffer: Buffer; contentType: string }> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -159,6 +233,8 @@ export const handler = async (event: AnyEvent): Promise<APIGatewayProxyResultV2>
         if (!isHttpUrl(url)) {
             return jsonResponse(400, { success: false, error: 'url must be http(s)' });
         }
+
+        await assertPublicHost(new URL(url).hostname);
 
         const { buffer, contentType } = await fetchImage(url);
         const base64 = buffer.toString('base64');
