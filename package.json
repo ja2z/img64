@@ -1,0 +1,16 @@
+{
+  "name": "img64",
+  "version": "0.1.0",
+  "description": "Lambda that returns an HTML <img> tag with a base64 data URI for a given image URL",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "package": "./build-lambda.sh",
+    "deploy": "./deploy-lambda-s3.sh"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.4"
+  }
+}
